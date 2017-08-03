@@ -15,8 +15,8 @@ def bg_grey;        "\033[47m#{self}\033[0m" end
 end
 
 class Sslinfo
-  attr_accessor :subject, :issuer, :startdate, :enddate, :file, :modulus, :intermediatecert, :serverca, :clientca
-  def initialize(subject, issuer, subject_alt, startdate, enddate, serverca, clientca, file, modulus, intermediatecert)
+  attr_accessor :subject, :issuer, :startdate, :enddate, :file, :modulus, :intermediatecert, :serverca, :clientca, :subject_alt, :hpkp
+  def initialize(subject, issuer, subject_alt, startdate, enddate, serverca, clientca, file, modulus, intermediatecert, hpkp)
   @subject = subject
   @file = file
   @subject_alt = subject_alt
@@ -27,6 +27,7 @@ class Sslinfo
   @clientca = clientca
   @modulus = modulus
   @intermediatecert = intermediatecert
+  @hpkp = hpkp
   end
 
   def to_ary
@@ -42,14 +43,19 @@ if ARGV[0]
  if File.directory?("#{ARGV[0]}")
  CURWD = Dir.pwd
  Dir.chdir(ARGV[0])
- OUTPUTDIR = Dir.pwd
+	if ARGV[1]
+	OUTPUTDIR = ARGV[1]
+	else
+ 	OUTPUTDIR = Dir.pwd 
+	end
  Dir.chdir(CURWD)
  else
  abort "ERROR: outputdir #{ARGV[0]} does not exist".red
  end
 else
- abort "ERROR: please use: #{$0}: outputdir #(should exist)".red
+ abort "ERROR: please use: #{$0}: [outputdir, should exist] [absolute-path-to-files (optional, will be absolute to outputdir if not specified)]".red
 end
+
 
 CAFILE="#{File.dirname("#{$0}")}/curl-ca-bundle.crt"
 TIMES = Hash.new
@@ -80,7 +86,7 @@ modulus=%x[cat #{file} | openssl x509 -noout -modulus]
 return "#{modulus.split('=')[1].strip}"
 end
 
-def sslparser(processedinfo,type,parsedinfo,subject_alt='NA',file='NA', modulus='NA', intermediatecert='NA')
+def sslparser(processedinfo,type,parsedinfo,subject_alt='NA',file='NA', modulus='NA', intermediatecert='NA', hpkp='')
  enddate='NA'
  enddate_i='NA'
  startdate='NA'
@@ -109,9 +115,9 @@ def sslparser(processedinfo,type,parsedinfo,subject_alt='NA',file='NA', modulus=
 }
    case type
 	when /CA|INT/
-   	return Sslinfo.new(subject, issuer, '', startdate_i, enddate_i, serverca, clientca, file, modulus, intermediatecert)
+   	return Sslinfo.new(subject, issuer, '', startdate_i, enddate_i, serverca, clientca, file, modulus, intermediatecert, hpkp)
 	when /CLIENT/
-   	return Sslinfo.new(subject, issuer, subject_alt, startdate_i, enddate_i, serverca, clientca, file, modulus, intermediatecert)
+   	return Sslinfo.new(subject, issuer, subject_alt, startdate_i, enddate_i, serverca, clientca, file, modulus, intermediatecert, hpkp)
    end
 end
 
@@ -130,7 +136,7 @@ certfile=File.open("#{certfiletobe}",'r')
 certfiledata=certfile.read
 certfile.close
 certfile=File.open("#{certfiletobe}",'w')
-marker="cert: #{cn} #{hash["file"]}"
+marker="cert: #{cn} alt: #{hash["subject_alt"]} originalfile: #{hash["file"]}"
 certfile.write("#{marker}\n#{marker.gsub(/./, '=')}\n#{certfiledata}")
 certfile.close
 ## intermediate data
@@ -193,13 +199,20 @@ end
  certintermediatesfile=File.open("#{OUTPUTDIR}/#{cn}/#{intermediate_base}.pem",'r')
  certintermediatesfiledata=certintermediatesfile.read
  certintermediatesfile.close
+ hpkpintermediatesfile="pin-sha256=\"#{%x[openssl x509 -in "#{OUTPUTDIR}/#{cn}/#{intermediate_base}.pem" -pubkey -noout | openssl rsa -pubin -outform der 2>/dev/null | openssl dgst -sha256 -binary | openssl enc -base64].strip}\"; "
 
  nginxcertfile=File.open("#{OUTPUTDIR}/#{cn}/#{cn}.nginx.certificates",'w')
  nginxcertfile.write("#{certdata}\n#{certintermediatesfiledata}\n")
  nginxcertfile.close
 
  configfile=File.open("#{OUTPUTDIR}/#{cn}.nginx.conf",'w')
- configfile.write("ssl_certificate #{OUTPUTDIR}/#{cn}/#{cn}.nginx.certificates;\nssl_certificate_key #{keyfiletobe};\n")
+ if certintermediatesfiledata.length > 1
+ hpkpheaders="#{hash["hpkp"]} #{hpkpintermediatesfile}" 
+ else
+ hpkpheaders="#{hash["hpkp"]}"
+ end
+ extra_header="\nadd_header Public-Key-Pins '#{hpkpheaders} max-age=2592000;'\n\n"
+ configfile.write("ssl_certificate #{OUTPUTDIR}/#{cn}/#{cn}.nginx.certificates;\nssl_certificate_key #{keyfiletobe}\n")
  configfile.close
 
 ## apache config
@@ -229,9 +242,11 @@ end
 
 if line =~ /^.*END CERTIFICATE.*$/
  parsedinfo=%x[echo "#{sslinfo}" | openssl x509 -purpose -enddate -startdate -subject -issuer  -noout ]
+ #hpkp="pin-sha256=\"#{%x[echo "#{sslinfo}" | openssl x509 -pubkey -noout | openssl rsa -pubin -outform der 2>/dev/null | openssl dgst -sha256 -binary | openssl enc -base64].strip}\"; "
  started=0
  sslinfo=''
  processedinfo["#{subject}"] = sslparser(processedinfo,'CA',parsedinfo)
+ #processedinfo["#{subject}"] = sslparser(processedinfo,'CA',parsedinfo,'','','','',hpkp)
  break
 end
 }
@@ -259,7 +274,8 @@ certsdirs.each {|dir|
 	subject_alternatives=''
 	intermediatecert=''
 	parsedinfov2.each_line {|linev2| 	subject_alternatives=linev2.strip.gsub('DNS:','') if linev2 =~ /^.*DNS.*$/ 	;intermediatecert=linev2.split('CA Issuers -')[1].gsub('URI:','').strip if linev2 =~ /^.*CA Issuers.*$/}
-	processedinfo["#{file}"] = sslparser(processedinfo,'CLIENT',parsedinfo,subject_alternatives,file,modulus,intermediatecert)
+	hpkp="pin-sha256=\"#{%x[openssl x509 -in '#{file}' -pubkey -noout | openssl rsa -pubin -outform der 2>/dev/null | openssl dgst -sha256 -binary | openssl enc -base64].strip}\"; "
+	processedinfo["#{file}"] = sslparser(processedinfo,'CLIENT',parsedinfo,subject_alternatives,file,modulus,intermediatecert,hpkp)
 	end
 	}
 }
@@ -271,27 +287,31 @@ processedinfo.keys.each {|subject|
 ## enduser cert check
 if processedinfo["#{subject}"].serverca == 'No'
 
+ certcn=processedinfo["#{subject}"].subject.split('CN=')[1].strip
+ tmpmodulus=processedinfo["#{subject}"].modulus
+ human_startdate=DateTime.strptime("#{processedinfo["#{subject}"].startdate}",'%s').strftime("%Y_%m_%d")
+ human_enddate=DateTime.strptime("#{processedinfo["#{subject}"].enddate}",'%s').strftime("%Y_%m_%d")
+
  if processedinfo["#{subject}"].startdate > TIMES["now"]
- puts "cert #{subject} not allowed to be used yet (#{processedinfo["#{subject}"].file})"
+ puts "cert #{subject} not allowed to be used yet (#{processedinfo["#{subject}"].file} start:#{human_startdate} end:#{human_enddate})"
  end
 
  if processedinfo["#{subject}"].enddate < TIMES["now"]
- puts "cert #{subject} expired (#{processedinfo["#{subject}"].file})".red.bold.bg_grey
+ puts "cert #{subject} expired (start:#{human_startdate} end:#{human_enddate})".red.bold.bg_grey
  next
  elsif processedinfo["#{subject}"].enddate < TIMES["90day"]
- puts "cert #{subject} expiring within 90 days".yellow
+ puts "cert #{subject} expiring within 90 days (start:#{human_startdate} end:#{human_enddate})".yellow
  elsif processedinfo["#{subject}"].enddate <= TIMES["180day"] and processedinfo["#{subject}"].enddate >= TIMES["90day"]
- puts "cert #{subject} expiring within 180 days".green
+ puts "cert #{subject} expiring within 180 days (start:#{human_startdate} end:#{human_enddate})".green
  end
 
- certcn=processedinfo["#{subject}"].subject.split('CN=')[1].strip
- tmpmodulus=processedinfo["#{subject}"].modulus
+
  if !tmphash.key?("#{certcn}")
   if moduluskeyinfo.key?("#{tmpmodulus}")
    tmphash["#{certcn}"] = Hash.new
    tmphash["#{certcn}"]['keyfile'] = moduluskeyinfo["#{tmpmodulus}"] 
   else
-   puts "ERROR: no known keyfile for cert #{certcn}".red
+   puts "ERROR: no known keyfile for cert #{certcn} (#{processedinfo["#{subject}"].file} start:#{human_startdate} end:#{human_enddate})".red
    next
   end
   #puts "creating new hash for #{certcn}"
@@ -301,22 +321,29 @@ if processedinfo["#{subject}"].serverca == 'No'
   tmphash["#{certcn}"]['modulus'] = "#{tmpmodulus}"
   tmphash["#{certcn}"]['intermediatecert'] = processedinfo["#{subject}"].intermediatecert
   tmphash["#{certcn}"]['issuer'] = processedinfo["#{subject}"].issuer
+  tmphash["#{certcn}"]['subject_alt'] = processedinfo["#{subject}"].subject_alt
+  tmphash["#{certcn}"]['hpkp'] = processedinfo["#{subject}"].hpkp
  elsif tmphash["#{certcn}"]['startdate'] <= processedinfo["#{subject}"].startdate
   if moduluskeyinfo.key?("#{tmpmodulus}")
    tmphash["#{certcn}"]['keyfile'] = moduluskeyinfo["#{tmpmodulus}"] 
   else
-   puts "ERROR: no known keyfile for cert #{certcn}".red
+   puts "ERROR: no known keyfile for cert #{certcn} (#{processedinfo["#{subject}"].file} start:#{human_startdate} end:#{human_enddate})".red
    next
   end
-  puts "updating hash for #{certcn} (old: #{tmphash["#{certcn}"]['file']} new: #{processedinfo["#{subject}"].file}".green
+  tmphash_human_startdate=DateTime.strptime("#{tmphash["#{certcn}"]['startdate']}",'%s').strftime("%Y_%m_%d")
+  tmphash_human_enddate=DateTime.strptime("#{tmphash["#{certcn}"]['enddate']}",'%s').strftime("%Y_%m_%d")
+  puts "updating hash for #{certcn} (old: #{tmphash["#{certcn}"]['file']} #{tmphash_human_startdate}/#{tmphash_human_enddate}, new: #{processedinfo["#{subject}"].file} start:#{human_startdate} end:#{human_enddate}".green
   tmphash["#{certcn}"]['startdate'] = processedinfo["#{subject}"].startdate
   tmphash["#{certcn}"]['enddate'] = processedinfo["#{subject}"].enddate
   tmphash["#{certcn}"]['file'] = processedinfo["#{subject}"].file
   tmphash["#{certcn}"]['modulus'] = "#{tmpmodulus}"
   tmphash["#{certcn}"]['intermediatecert'] = processedinfo["#{subject}"].intermediatecert
   tmphash["#{certcn}"]['issuer'] = processedinfo["#{subject}"].issuer
+  tmphash["#{certcn}"]['subject_alt'] = processedinfo["#{subject}"].subject_alt
+  tmphash["#{certcn}"]['hpkp'] = processedinfo["#{subject}"].hpkp
  else
-  puts "skipping CN:#{certcn} #{subject} as #{processedinfo["#{subject}"].startdate} is issued before then #{tmphash["#{certcn}"]['startdate']}, so keeping #{tmphash["#{certcn}"]['file']}".yellow
+  tmphash_human_startdate=DateTime.strptime("#{tmphash["#{certcn}"]['startdate']}",'%s').strftime("%Y_%m_%d")
+  puts "skipping CN:#{certcn} #{subject} #{human_startdate} is issued before #{tmphash_human_startdate}, so keeping #{tmphash["#{certcn}"]['file']}".yellow
  end
 
 end
