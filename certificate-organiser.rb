@@ -128,7 +128,8 @@ startdate=DateTime.strptime("#{hash["startdate"]}",'%s').strftime("%Y_%m_%d")
 enddate=DateTime.strptime("#{hash["enddate"]}",'%s').strftime("%Y_%m_%d")
 keyfiletobe="#{OUTPUTDIR}/#{cn}/#{cn}__#{startdate}_#{enddate}.keyfile"
 certfiletobe="#{OUTPUTDIR}/#{cn}/#{cn}__#{startdate}_#{enddate}.certificate.pem"
-FileUtils.mkdir "#{OUTPUTDIR}/#{cn}" if ! File.directory?("#{OUTPUTDIR}/#{cn}")
+puts cn
+FileUtils.mkdir_p "#{OUTPUTDIR}/#{cn}" if ! File.directory?("#{OUTPUTDIR}/#{cn}")
 FileUtils.cp(hash["keyfile"],"#{keyfiletobe}")
 FileUtils.cp(hash["file"],"#{certfiletobe}")
 ## rewrite the cert to add some debuginfo
@@ -140,7 +141,9 @@ marker="cert: #{cn} alt: #{hash["subject_alt"]} originalfile: #{hash["file"]}"
 certfile.write("#{marker}\n#{marker.gsub(/./, '=')}\n#{certfiledata}")
 certfile.close
 ## intermediate data
- if hash["intermediatecert"]
+ puts "debugg:##{hash["intermediatecert"]}#"
+ if hash["intermediatecert"] and  not hash["intermediatecert"].empty?
+ puts "debug:#{URI.parse(hash["intermediatecert"])}##"
  intermediate=Net::HTTP.get(URI.parse(hash["intermediatecert"]))
  intermediate_base=File.basename("#{hash["intermediatecert"]}")
  ## write intermediate cert
@@ -265,8 +268,10 @@ certsdirs.each {|dir|
  mime = %x[file #{file}]
  case mime
 	when /^.*key$/
+	puts "keyfile #{file}"
 	moduluskeyinfo["#{parse_key_file(file)}"] = "#{file}"
 	when /^.*certificate$/
+	puts "certs #{file}"
 	modulus=parse_cert_file(file)
 	moduluscertinfo["#{modulus}"] = "#{file}"
         parsedinfo=%x[openssl x509 -purpose -enddate -startdate -subject -issuer  -noout -in "#{file}"]
@@ -276,7 +281,25 @@ certsdirs.each {|dir|
 	parsedinfov2.each_line {|linev2| 	subject_alternatives=linev2.strip.gsub('DNS:','') if linev2 =~ /^.*DNS.*$/ 	;intermediatecert=linev2.split('CA Issuers -')[1].gsub('URI:','').strip if linev2 =~ /^.*CA Issuers.*$/}
 	hpkp="pin-sha256=\"#{%x[openssl x509 -in '#{file}' -pubkey -noout | openssl rsa -pubin -outform der 2>/dev/null | openssl dgst -sha256 -binary | openssl enc -base64].strip}\"; "
 	processedinfo["#{file}"] = sslparser(processedinfo,'CLIENT',parsedinfo,subject_alternatives,file,modulus,intermediatecert,hpkp)
-	end
+	when /^.*ASCII.*$/
+		greptmp = %x[grep BEGIN #{file}]
+		case greptmp
+			when /^.*PRIVATE KEY.*$/
+			puts "keyfile #{file}"
+			moduluskeyinfo["#{parse_key_file(file)}"] = "#{file}"
+			when /^.*CERTIFICATE.*$/
+		        puts "certs #{file}"
+		        modulus=parse_cert_file(file)
+		        moduluscertinfo["#{modulus}"] = "#{file}"
+		        parsedinfo=%x[openssl x509 -purpose -enddate -startdate -subject -issuer  -noout -in "#{file}"]
+		        parsedinfov2=%x[openssl x509 -text -certopt no_subject,no_header,no_version,no_serial,no_pubkey,no_sigdump,no_aux   -noout -in "#{file}"]
+		        subject_alternatives=''
+		        intermediatecert=''
+		        parsedinfov2.each_line {|linev2|        subject_alternatives=linev2.strip.gsub('DNS:','') if linev2 =~ /^.*DNS.*$/      ;intermediatecert=linev2.split('CA Issuers -')[1].gsub('URI:','').strip if linev2 =~ /^.*CA Issuers.*$/}
+		        hpkp="pin-sha256=\"#{%x[openssl x509 -in '#{file}' -pubkey -noout | openssl rsa -pubin -outform der 2>/dev/null | openssl dgst -sha256 -binary | openssl enc -base64].strip}\"; "
+		        processedinfo["#{file}"] = sslparser(processedinfo,'CLIENT',parsedinfo,subject_alternatives,file,modulus,intermediatecert,hpkp)	
+		end
+ end
 	}
 }
 
@@ -287,7 +310,7 @@ processedinfo.keys.each {|subject|
 ## enduser cert check
 if processedinfo["#{subject}"].serverca == 'No'
 
- certcn=processedinfo["#{subject}"].subject.split('CN=')[1].strip
+ certcn=processedinfo["#{subject}"].subject.split('CN=')[1].split('/')[0].strip
  tmpmodulus=processedinfo["#{subject}"].modulus
  human_startdate=DateTime.strptime("#{processedinfo["#{subject}"].startdate}",'%s').strftime("%Y_%m_%d")
  human_enddate=DateTime.strptime("#{processedinfo["#{subject}"].enddate}",'%s').strftime("%Y_%m_%d")
